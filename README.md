@@ -1,31 +1,86 @@
 # Hybrid Trading Bots (MT5 + PocketOption)
 
-This workspace now contains two independent bot paths:
+Two independent bot paths live in this repo:
 
-- `mt5_signal_bot.py`: MT5 EUR/USD signal bot
-- `pocket_signal_bot/`: PocketOption hybrid signal bot (`paper` + `demo`)
+- `mt5_signal_bot.py` — MT5 EUR/USD signal bot (Windows only)
+- `pocket_signal_bot/` — PocketOption hybrid signal bot (`paper` / `demo` / `live`) **with a web dashboard**
 
-## PocketOption Hybrid Signal Bot
+> No strategy guarantees profit. Treat this as research/automation infrastructure and validate on
+> `paper` and `demo` first. `PO_MODE=live` trades real money and requires an explicit confirmation flag.
 
-The PocketOption bot is designed around:
+## Быстрый старт (RU)
 
-- EMA + RSI signal engine (`CALL` / `PUT` / `NO_TRADE`)
-- Risk controls (daily stops, max losses, max trades/day, min payout)
-- Hybrid adapters:
-  - Unofficial API adapter (primary)
-  - Browser adapter fallback
-- Structured event logs with timing fields
+```bash
+./setup.sh                       # venv + зависимости + .env из .env.example
+source .venv/bin/activate
+python -m pocket_signal_bot.dashboard
+```
+
+Откройте `http://127.0.0.1:8000` — дашборд сам запускает бота в **paper**-режиме:
+синтетический рынок, сигналы EMA+RSI, сделки, PnL, win rate, PNG-графики и живой журнал событий.
+
+- Кнопка **Стоп / Запустить** — управление движком, настройки внизу страницы.
+- Пресеты **60/60** и **15/15** — быстрый A/B-тест таймфрейма и экспирации.
+- Símbolo/ставка/риск-лимиты меняются в UI и сохраняются в `data/dashboard_settings.json`.
+- Терминальный режим (без UI): `python -m pocket_signal_bot.runner`.
+
+## Quick start (EN)
+
+```bash
+./setup.sh                       # venv + deps + .env copy
+source .venv/bin/activate
+python -m pocket_signal_bot.dashboard      # web UI on :8000, autostarts paper mode
+python -m pocket_signal_bot.runner         # headless terminal mode
+python -m unittest discover -s tests -t .  # 40 unit tests
+```
+
+Only `python-dotenv` + `matplotlib` are needed for paper mode and the dashboard; Playwright and the
+unofficial SDK are optional and only used for `demo`/`live`.
+
+## What was assembled
+
+The repo previously contained the strategy, risk manager, adapters and trade storage, but three
+things prevented it from actually running as a bot:
+
+1. **Paper mode never traded.** `_paper_candles()` regenerated an almost perfectly flat series, so
+   the chop filter (`PO_MIN_RANGE_PCT`) blocked every signal. Replaced with a synthetic market feed
+   (`paper_signal_bot/paper_feed.py`) that does a realistic random walk with drift regimes and
+   sub-candle ticks.
+2. **No visibility.** The loop only printed log lines. `HybridRunner` now publishes a state snapshot
+   on every poll (`on_state`), streams events (`on_event`) and supports `request_stop()`, which the
+   new dashboard (`pocket_signal_bot/dashboard.py`, stdlib only) uses for live UI + start/stop.
+3. **Signals were unexplainable.** `generate_details()` now returns a `reason`
+   (`strict_trigger`, `vote_fallback`, `chop_filter`, `rsi_neutral`, `trend_streak`,
+   `fallback_disabled`, `insufficient_data`) so the UI can show *why* there is no trade.
+
+Also: dependency markers so `pip install -r requirements.txt` works on Linux/macOS, 40 unit tests,
+`setup.sh`, `.env.example` additions, and removed committed `__pycache__` artifacts.
+
+## PocketOption bot architecture
+
+- EMA + RSI signal engine (`CALL` / `PUT` / `NO_TRADE`) with trend-streak, chop and neutral-RSI filters
+- Signal post-processing: consecutive-poll confirmation and optional flip cooldown
+- Risk controls: daily loss stop, max losses in a row, max trades/day, min payout, stale-signal guard
+- Hybrid adapters: unofficial API adapter (primary) + Playwright browser adapter (fallback)
+- Trade history JSON + auto-generated PNG charts (`latest_pnl`, `latest_winrate`, `compare_setups`, `dashboard`)
+- Web dashboard: live signal, indicators, risk usage, trades, event log, charts, settings
 
 ### Files
 
-- `pocket_signal_bot/config.py`
-- `pocket_signal_bot/strategy.py`
-- `pocket_signal_bot/risk.py`
-- `pocket_signal_bot/paper_simulator.py`
-- `pocket_signal_bot/adapters/api_adapter.py`
-- `pocket_signal_bot/adapters/browser_adapter.py`
-- `pocket_signal_bot/runner.py`
-- `pocket_signal_bot/logger.py`
+| Path | Role |
+|------|------|
+| `pocket_signal_bot/config.py` | `.env` → `BotConfig`, live-mode safety validation |
+| `pocket_signal_bot/strategy.py` | EMA/RSI engine + explainable `reason` |
+| `pocket_signal_bot/risk.py` | daily stop, streak stop, payout/age gates |
+| `pocket_signal_bot/paper_feed.py` | synthetic market for `PO_MODE=paper` |
+| `pocket_signal_bot/paper_simulator.py` | binary-contract settlement |
+| `pocket_signal_bot/trade_store.py` | sessions/trades JSON persistence |
+| `pocket_signal_bot/charts.py` | PNG charts (matplotlib) |
+| `pocket_signal_bot/adapters/api_adapter.py` | unofficial `pocket-option` SDK adapter |
+| `pocket_signal_bot/adapters/browser_adapter.py` | Playwright/WS-quote browser fallback |
+| `pocket_signal_bot/runner.py` | the trading loop (state hooks + graceful stop) |
+| `pocket_signal_bot/dashboard.py` | HTTP server + single-page UI |
+| `tests/` | `unittest` suite (`python -m unittest discover -s tests -t .`) |
 
 ## Install
 
@@ -33,96 +88,89 @@ The PocketOption bot is designed around:
 pip install -r requirements.txt
 ```
 
-If using browser fallback, also install browser runtime:
+`MetaTrader5` is installed only on Windows, `pocket-option` only on Python ≥ 3.13 (see the
+environment markers in `requirements.txt`). If you use the browser fallback:
 
 ```bash
 python -m playwright install chromium
 ```
 
-### Demo mode: fix “Could not read current price from UI”
-
-1. Set in `.env`: `PO_HEADLESS=false` and `PO_BROWSER_STARTUP_WAIT_SEC=15` (or higher on slow PCs).
-2. Run `python -m pocket_signal_bot.runner`. A Chromium window opens on the quick-trading URL.
-3. **Log in** if you see a login page; wait until the **live quote** is visible.
-4. In normal Chrome on the same page: **F12 → Elements → select tool → click the price number → right‑click element → Copy → Copy selector**.
-5. Put that string in `.env` as `PO_PRICE_SELECTOR=...` (use `|` between multiple selectors to try in order).
-6. Run the bot again. If API still fails, browser candles will work once the selector matches.
-
-The bot no longer exits the whole process when browser price read fails once; it logs `data_error` and retries on the next poll.
-
-If the chart price is drawn on a **canvas** (no numeric `<span>`), keep **`PO_USE_WS_QUOTES=true`** (default). The browser adapter listens to the page **WebSocket** (e.g. `update_quotes`) and extracts the last price for **`PO_SYMBOL`** without needing `PO_PRICE_SELECTOR`.
-
-## Environment file (optional)
-
-Copy the sample and edit:
+## Dashboard
 
 ```bash
-copy .env.example .env
+python -m pocket_signal_bot.dashboard
+# http://127.0.0.1:8000  (PO_DASHBOARD_HOST/PORT to change)
+```
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/state` | status, signal, indicators, candles, session stats, trades, events |
+| `POST /api/start` / `POST /api/stop` | start / stop the engine |
+| `POST /api/restart` | stop, save settings, start again |
+| `GET /api/chart?name=latest_pnl.png` | generated PNG chart |
+| `GET /api/history` | download `data/trading_history.json` |
+
+`PO_DASHBOARD_AUTOSTART=true` (default) starts the bot in paper mode right away.
+
+## Environment file
+
+```bash
+cp .env.example .env
 ```
 
 `pocket_signal_bot/config.py` loads `.env` automatically when `python-dotenv` is installed.
 
-## PocketOption credentials (demo first)
+### PocketOption credentials (demo first)
 
-Set environment variables before running (or put them in `.env`):
-
-- `PO_SESSION` -> session token from PocketOption web auth flow
-- `PO_UID` -> your account uid
+- `PO_SESSION` — session token from the PocketOption web auth flow
+- `PO_UID` — your account uid
 - `PO_IS_DEMO=true`
-- `PO_MODE=paper` | `demo` | `live` (live = real money; requires `PO_LIVE_CONFIRMED=true`)
-- Optional symbol/time controls:
-  - `PO_SYMBOL=EURUSD_otc`
-  - `PO_TIMEFRAME_SEC=60`
-  - `PO_EXPIRY_SEC=60`
+- `PO_MODE=paper|demo|live` (live needs `PO_LIVE_CONFIRMED=true`)
+- Optional: `PO_SYMBOL=EURUSD_otc`, `PO_TIMEFRAME_SEC=60`, `PO_EXPIRY_SEC=60`
 
-## Run
-
-Paper mode (safe):
+### Demo/live run (terminal)
 
 ```bash
-set PO_MODE=paper
-python -m pocket_signal_bot.runner
+# demo
+PO_MODE=demo PO_SESSION=... PO_UID=... python -m pocket_signal_bot.runner
+
+# live (real money — refused unless confirmed)
+PO_MODE=live PO_LIVE_CONFIRMED=true PO_IS_DEMO=false PO_SESSION=... PO_UID=... \
+  python -m pocket_signal_bot.runner
 ```
 
-Demo mode (PocketOption demo account):
+The same modes are selectable in the dashboard. Without Playwright + valid cookies the bot logs
+connection errors and keeps retrying; paper mode needs neither.
 
-```bash
-set PO_MODE=demo
-set PO_SESSION=your_session
-set PO_UID=your_uid
-python -m pocket_signal_bot.runner
-```
+### Demo mode: fix “Could not read current price from UI”
 
-Live mode (real money — same code path as demo, but `api_is_demo=false` and real cabinet URL for browser):
+1. Set `PO_HEADLESS=false` and `PO_BROWSER_STARTUP_WAIT_SEC=15` (or higher on slow PCs).
+2. Run the bot; a Chromium window opens on the quick-trading URL.
+3. **Log in** and wait until the live quote is visible.
+4. In normal Chrome: **F12 → Elements → select → click the price → Copy → Copy selector**.
+5. Put it in `.env` as `PO_PRICE_SELECTOR=...` (use `|` between several selectors).
+6. Re-run. Browser candles work once the selector matches.
 
-```bash
-set PO_MODE=live
-set PO_LIVE_CONFIRMED=true
-set PO_SESSION=your_real_session
-set PO_UID=your_real_uid
-set PO_IS_DEMO=false
-python -m pocket_signal_bot.runner
-```
+The bot logs `data_error` and retries instead of exiting when a quote read fails.
 
-The bot refuses to start `PO_MODE=live` unless `PO_LIVE_CONFIRMED=true`.
-
-Event output goes to the terminal when `PO_CONSOLE_LOG=true` (no log files are written).
+If the chart price is drawn on a **canvas**, keep `PO_USE_WS_QUOTES=true` (default): the adapter reads
+page WebSocket `update_quotes` payloads for `PO_SYMBOL`, no selector needed.
 
 ## Trade history & PNG charts
 
-Each run stores trades in `data/trading_history.json`. After every settled trade (if `PO_CHARTS_AUTO=true`), PNG charts are written to `data/charts/`:
+Each run stores trades in `data/trading_history.json`. After every settled trade (with
+`PO_CHARTS_AUTO=true`) PNGs are written to `data/charts/`:
 
 | File | Content |
 |------|---------|
-| `latest_pnl.png` | Cumulative PnL + per-trade bars (current session) |
-| `latest_winrate.png` | Win rate over trade number |
-| `compare_setups.png` | Compare **15/15**, **30/30**, **60/60**, **M5/M3** sessions |
-| `dashboard.png` | All sessions’ PnL curves overlaid |
+| `latest_pnl.png` | cumulative PnL + per-trade bars (current session) |
+| `latest_winrate.png` | win rate over trade number |
+| `compare_setups.png` | compare **15/15**, **30/30**, **60/60**, **M5/M3** sessions |
+| `dashboard.png` | all sessions’ PnL curves overlaid |
 
-**A/B test workflow** — change Pocket Option + `.env` for each setup, run demo, stop bot (Ctrl+C), repeat:
+**A/B workflow** — change the setup in the UI (or `.env`), run demo, stop:
 
 ```env
-# Example: 15s candle + 15s bet
 PO_TIMEFRAME_SEC=15
 PO_EXPIRY_SEC=15
 ```
@@ -133,7 +181,17 @@ Regenerate charts anytime:
 python -m pocket_signal_bot.charts
 ```
 
-Optional: `PO_EXPERIMENT_LABEL=15/15` overrides the auto label used in comparison charts.
+`PO_EXPERIMENT_LABEL=15/15` overrides the auto label.
+
+## Paper mode notes
+
+The synthetic feed uses a random walk with slowly switching drift regimes, volatility
+`PO_PAPER_VOLATILITY_PIPS` (1.3 pips per 60 s candle, scaled by `sqrt(timeframe/60)`), sub-candle
+ticks every poll, and a new candle per `timeframe_sec`. `PO_PAPER_SEED>0` makes a run reproducible.
+
+Short timeframes are noisier and their 20-candle range is smaller — if the UI shows
+*«Флэт: диапазон рынка слишком узкий»*, lower **Мин. диапазон, %** (e.g. `0.02`) or use a larger
+timeframe. This is the same chop filter that protects demo/live trading.
 
 ## Readiness checklist before live
 
@@ -142,7 +200,3 @@ Optional: `PO_EXPERIMENT_LABEL=15/15` overrides the auto label used in compariso
 - No recurring adapter disconnect loop
 - Latency and failover behavior verified in logs
 - Risk limits tested (daily stop, max losses, max trades)
-
-## Important
-
-No strategy guarantees profit. Treat this as research/automation infrastructure and validate on demo first.

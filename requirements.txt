@@ -1,6 +1,15 @@
-MetaTrader5>=5.0.45
-pocket-option>=0.1.6
-playwright>=1.52.0
+# Core runtime (paper mode + dashboard + charts)
 python-dotenv>=1.0.0
-websockets
 matplotlib>=3.8.0
+websockets>=12.0
+
+# Browser fallback (Playwright). After install run:
+#   python -m playwright install chromium
+playwright>=1.52.0
+
+# Windows-only: MT5 terminal bridge (mt5_signal_bot.py)
+MetaTrader5>=5.0.45; sys_platform == "win32"
+
+# Unofficial PocketOption SDK — requires Python >= 3.13.
+# Not needed for PO_MODE=paper or for the browser fallback.
+pocket-option>=0.1.6; python_version >= "3.13"

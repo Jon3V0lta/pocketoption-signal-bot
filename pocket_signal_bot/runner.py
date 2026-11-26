@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from pocket_signal_bot.adapters.api_adapter import PocketApiConfig, PocketOptionApiAdapter
 from pocket_signal_bot.adapters.browser_adapter import BrowserConfig, PocketOptionBrowserAdapter
 from pocket_signal_bot.config import BotConfig, validate_config
 from pocket_signal_bot.logger import JsonEventLogger
+from pocket_signal_bot.paper_feed import PaperFeedConfig, SyntheticMarketFeed
 from pocket_signal_bot.paper_simulator import PocketPaperSimulator
 from pocket_signal_bot.risk import RiskConfig, RiskManager
 from pocket_signal_bot.strategy import EmaRsiStrategy, StrategyConfig
@@ -16,14 +18,28 @@ from pocket_signal_bot.trade_store import TradeStore
 
 try:
     from pocket_signal_bot.charts import generate_charts
-except ImportError:
+except ImportError:  # pragma: no cover - matplotlib optional
     generate_charts = None  # type: ignore[misc, assignment]
 
 
 class HybridRunner:
-    def __init__(self, cfg: BotConfig):
+    """Candle → strategy → risk → order loop.
+
+    The runner is UI-agnostic: pass ``on_state`` to receive snapshots on every
+    poll (used by the web dashboard) and call :meth:`request_stop` to stop the
+    loop cleanly from another thread.
+    """
+
+    def __init__(
+        self,
+        cfg: BotConfig,
+        *,
+        on_state: Callable[[dict[str, Any]], None] | None = None,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    ):
         self.cfg = cfg
-        self.logger = JsonEventLogger(console=cfg.po_console_log)
+        self.logger = JsonEventLogger(console=cfg.po_console_log, on_event=on_event)
+        self.on_state = on_state
         self.strategy = EmaRsiStrategy(
             StrategyConfig(
                 ema_fast=cfg.ema_fast,
@@ -75,7 +91,6 @@ class HybridRunner:
             start_balance=1000.0,
         )
         self.balance = 1000.0
-        self._paper_price = 1.0800
         self._api_candles_disabled = False
         self._api_candles_fail_count = 0
         self._api_connected = False
@@ -92,8 +107,45 @@ class HybridRunner:
         self._session_wins: int = 0
         self._session_losses: int = 0
         self._session_pushes: int = 0
+        # Synthetic market used by PO_MODE=paper
+        self._paper_feed: SyntheticMarketFeed | None = None
+        if cfg.effective_mode == "paper":
+            self._paper_feed = SyntheticMarketFeed(
+                PaperFeedConfig(
+                    symbol=cfg.symbol,
+                    timeframe_sec=cfg.timeframe_sec,
+                    candle_count=cfg.candle_count,
+                    volatility_pips=max(0.05, cfg.paper_volatility_pips),
+                    seed=cfg.paper_seed or None,
+                )
+            )
+        self._paper_last_tick = time.monotonic()
+        # UI state
+        self.status: str = "idle"
+        self.started_at: str | None = None
+        self.last_error: str = ""
+        self._signal_state: dict[str, Any] = {"signal": "NO_TRADE", "reason": "starting"}
+        self._indicators: dict[str, Any] = {"ema_diff": 0.0, "rsi": 50.0, "momentum": 0.0}
+        self._closes: list[float] = []
+        self._candles_adapter = "—"
+        self._payout_adapter = "—"
+        self._payout = 0.0
+        self._stop_event = threading.Event()
         self.trade_store = TradeStore(cfg.trade_data_path)
+        # Never leave an orphaned session behind from a previous crashed run.
+        if self.trade_store.active_session():
+            self.trade_store.end_session()
         self._session_id = self.trade_store.begin_session(self._session_config_snapshot())
+
+    # ── Lifecycle helpers ────────────────────────────────────────────────────
+
+    def request_stop(self) -> None:
+        """Ask the loop to stop (safe to call from another thread)."""
+        self._stop_event.set()
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_event.is_set()
 
     def _session_config_snapshot(self) -> dict[str, Any]:
         return {
@@ -105,6 +157,79 @@ class HybridRunner:
             "experiment_label": self.cfg.experiment_label or self.cfg.time_pair_label,
             "trade_amount": self.cfg.trade_amount,
         }
+
+    def _state_snapshot(self) -> dict[str, Any]:
+        sessions = self.trade_store.all_sessions()
+        session = sessions[-1] if sessions else {}
+        trades = list(session.get("trades") or [])[-40:]
+        decided = self._session_wins + self._session_losses
+        return {
+            "running": self.status in ("connecting", "running", "settling"),
+            "status": self.status,
+            "mode": self.cfg.effective_mode,
+            "symbol": self.cfg.symbol,
+            "timeframe_sec": self.cfg.timeframe_sec,
+            "expiry_sec": self.cfg.expiry_sec,
+            "trade_amount": self.cfg.trade_amount,
+            "ema_fast": self.cfg.ema_fast,
+            "ema_slow": self.cfg.ema_slow,
+            "rsi_period": self.cfg.rsi_period,
+            "balance": round(self.balance, 2),
+            "started_at": self.started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "signal": dict(self._signal_state),
+            "indicators": dict(self._indicators),
+            "closes": self._closes[-180:],
+            "payout_pct": round(float(self._payout), 2),
+            "session": {
+                "pnl": round(self._session_pnl, 4),
+                "trades": self._session_trades,
+                "wins": self._session_wins,
+                "losses": self._session_losses,
+                "pushes": self._session_pushes,
+                "win_rate_pct": round(self._session_wins / decided * 100.0, 2) if decided else None,
+            },
+            "risk": {
+                "trades_today": self.risk.trades_today,
+                "max_trades_per_day": self.cfg.max_trades_per_day,
+                "consecutive_losses": self.risk.consecutive_losses,
+                "max_consecutive_losses": self.cfg.max_consecutive_losses,
+                "daily_loss_stop_pct": self.cfg.daily_loss_stop_pct,
+                "day_start_balance": round(self.risk.day_start_balance, 2),
+                "halted_reason": self.risk.halted_reason,
+            },
+            "adapters": {
+                "api": self._api_connected,
+                "browser": self._browser_connected,
+                "candles": self._candles_adapter,
+                "payout": self._payout_adapter,
+            },
+            "trades": trades,
+            "session_id": self._session_id,
+            "last_error": self.last_error,
+        }
+
+    def _publish(self, *, status: str | None = None) -> None:
+        if status is not None:
+            self.status = status
+        if self.on_state is None:
+            return
+        try:
+            self.on_state(self._state_snapshot())
+        except Exception:
+            pass
+
+    async def _sleep(self, seconds: float) -> None:
+        """Interruptible sleep that keeps the UI alive with fresh snapshots."""
+        end = time.monotonic() + max(0.0, float(seconds))
+        while not self._stop_event.is_set():
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(0.5, left))
+            self._publish()
+
+    # ── Persistence ──────────────────────────────────────────────────────────
 
     def _persist_trade(
         self,
@@ -285,17 +410,16 @@ class HybridRunner:
         except Exception:
             pass
 
-    # ── Paper candle generator ───────────────────────────────────────────────
+    # ── Paper candle feed ────────────────────────────────────────────────────
 
     def _paper_candles(self) -> list[dict[str, Any]]:
-        candles: list[dict[str, Any]] = []
-        price = self._paper_price
-        for i in range(self.cfg.candle_count):
-            drift = 0.00002 if i % 7 < 4 else -0.00001
-            price = max(0.5, price + drift)
-            candles.append({"close": round(price, 5)})
-        self._paper_price = price
-        return candles
+        if self._paper_feed is None:  # pragma: no cover - guarded by mode
+            return []
+        now = time.monotonic()
+        dt = now - self._paper_last_tick
+        self._paper_last_tick = now
+        self._paper_feed.update(dt)
+        return self._paper_feed.snapshot()
 
     # ── Adapter connect / disconnect ─────────────────────────────────────────
 
@@ -316,6 +440,7 @@ class HybridRunner:
                 self.logger.log("adapter_connect", adapter="api", ok=True)
             except asyncio.TimeoutError:
                 self._api_connected = False
+                self.last_error = f"API connect timeout after {timeout:g}s"
                 self.logger.log(
                     "adapter_connect",
                     adapter="api",
@@ -328,6 +453,7 @@ class HybridRunner:
                     pass
             except Exception as e:
                 self._api_connected = False
+                self.last_error = str(e)
                 self.logger.log("adapter_connect", adapter="api", ok=False, error=str(e))
 
         print(f"pocket_signal_bot: launching Chromium (max {timeout:g}s)…", flush=True)
@@ -337,6 +463,7 @@ class HybridRunner:
             self.logger.log("adapter_connect", adapter="browser", ok=True)
         except asyncio.TimeoutError:
             self._browser_connected = False
+            self.last_error = f"browser connect timeout after {timeout:g}s"
             self.logger.log(
                 "adapter_connect",
                 adapter="browser",
@@ -345,6 +472,7 @@ class HybridRunner:
             )
         except Exception as e:
             self._browser_connected = False
+            self.last_error = str(e)
             self.logger.log("adapter_connect", adapter="browser", ok=False, error=str(e))
 
         bal_timeout = min(15.0, max(5.0, timeout / 4))
@@ -435,7 +563,7 @@ class HybridRunner:
 
     async def _place_with_failover(self, direction: str, amount: float) -> tuple[str, str]:
         if not self.cfg.requires_broker:
-            return "paper-order", "paper"
+            return f"paper-{int(time.time() * 1000) % 1000000}", "paper"
         if self._api_connected:
             try:
                 order_id = await self._api_call(
@@ -466,6 +594,9 @@ class HybridRunner:
     # ── Main loop ────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.status = "connecting"
+        self._publish()
         self.logger.log(
             "startup",
             effective_mode=self.cfg.effective_mode,
@@ -473,6 +604,8 @@ class HybridRunner:
             requires_broker=self.cfg.requires_broker,
         )
         await self._safe_connect()
+        self.status = "running"
+        self._publish()
         if self.cfg.requires_broker and self.cfg.po_browser_overlay:
             await self._refresh_browser_overlay(
                 signal="—",
@@ -485,9 +618,19 @@ class HybridRunner:
                 extra="Log in if needed. WS quotes will populate shortly.",
             )
         try:
-            while True:
+            while not self._stop_event.is_set():
                 candles, candles_adapter = await self._get_candles_with_failover()
                 if not candles:
+                    self._signal_state = {
+                        "signal": "NO_TRADE",
+                        "raw_signal": "NO_TRADE",
+                        "reason": "no_data",
+                        "can_trade": False,
+                        "risk_reason": "no_candles",
+                        "confirm_streak": 0,
+                        "confirm_need": self.cfg.signal_confirm_polls,
+                    }
+                    self._publish()
                     self.logger.log("no_candles", adapter=candles_adapter)
                     await self._refresh_browser_overlay(
                         signal="NO_TRADE",
@@ -499,7 +642,7 @@ class HybridRunner:
                         last_close=None,
                         extra="Waiting for candle data…",
                     )
-                    await asyncio.sleep(self.cfg.poll_seconds)
+                    await self._sleep(self.cfg.poll_seconds)
                     continue
 
                 # Safe close extraction — skip malformed candles
@@ -510,8 +653,9 @@ class HybridRunner:
                     except (KeyError, TypeError, ValueError):
                         continue
                 if not closes:
-                    await asyncio.sleep(self.cfg.poll_seconds)
+                    await self._sleep(self.cfg.poll_seconds)
                     continue
+                self._closes = closes
 
                 signal_info = self.strategy.generate_details(closes)
                 raw_signal = str(signal_info["signal"])
@@ -527,6 +671,31 @@ class HybridRunner:
                     signal_age_ms=signal_age_ms,
                     current_balance=self.balance,
                 )
+                self._indicators = {
+                    "ema_diff": round(float(signal_info.get("ema_diff", 0.0)), 8),
+                    "rsi": round(float(signal_info.get("rsi", 50.0)), 4),
+                    "momentum": round(float(signal_info.get("momentum", 0.0)), 8),
+                }
+                self._signal_state = {
+                    "signal": signal,
+                    "raw_signal": raw_signal,
+                    "reason": str(signal_info.get("reason", "")),
+                    "can_trade": bool(can_trade),
+                    "risk_reason": reason,
+                    "confirm_streak": sig_meta.get("confirm_streak"),
+                    "confirm_need": sig_meta.get("confirm_need"),
+                    "flip_cooldown_active": sig_meta.get("flip_cooldown_active"),
+                    "payout_pct": round(float(payout), 2),
+                    "payout_source": payout_adapter,
+                    "candles_source": candles_adapter,
+                    "signal_age_ms": signal_age_ms,
+                    "last_close": closes[-1],
+                    "at": signal_ts.isoformat(),
+                }
+                self._candles_adapter = candles_adapter
+                self._payout_adapter = payout_adapter
+                self._payout = float(payout)
+                self._publish()
                 self.logger.log(
                     "signal",
                     signal=signal,
@@ -558,8 +727,9 @@ class HybridRunner:
                     try:
                         order_id, adapter_used = await self._place_with_failover(signal, trade_amount)
                     except Exception as e:
+                        self.last_error = str(e)
                         self.logger.log("order_error", signal=signal, error=str(e))
-                        await asyncio.sleep(self.cfg.poll_seconds)
+                        await self._sleep(self.cfg.poll_seconds)
                         continue
 
                     send_ts = datetime.now(timezone.utc)
@@ -583,10 +753,13 @@ class HybridRunner:
 
                     if self.cfg.effective_mode == "paper":
                         entry = closes[-1]
-                        await asyncio.sleep(self.cfg.expiry_sec)
+                        self._publish(status="settling")
+                        await self._sleep(self.cfg.expiry_sec)
+                        if self._stop_event.is_set():
+                            break
                         candles2, _ = await self._get_candles_with_failover()
                         if not candles2:
-                            await asyncio.sleep(self.cfg.poll_seconds)
+                            await self._sleep(self.cfg.poll_seconds)
                             continue
                         exit_price = float(candles2[-1]["close"])
                         result = self.paper.settle(
@@ -634,6 +807,7 @@ class HybridRunner:
                             extra=f"RESULT outcome={'win' if pnl > 0 else 'loss' if pnl < 0 else 'push'} pnl={pnl:+.2f}",
                         )
                     else:
+                        self._publish(status="settling")
                         try:
                             if adapter_used == "api":
                                 result = await self._api_call(
@@ -643,8 +817,9 @@ class HybridRunner:
                             else:
                                 result = await self.browser.check_result(order_id, self.cfg.expiry_sec)
                         except Exception as e:
+                            self.last_error = str(e)
                             self.logger.log("result_error", order_id=order_id, error=str(e))
-                            await asyncio.sleep(self.cfg.poll_seconds)
+                            await self._sleep(self.cfg.poll_seconds)
                             continue
 
                         pnl = self._normalize_settled_pnl(result, trade_amount, payout)
@@ -691,10 +866,15 @@ class HybridRunner:
                             ),
                         )
 
-                await asyncio.sleep(self.cfg.poll_seconds)
+                self.status = "running"
+                await self._sleep(self.cfg.poll_seconds)
         finally:
+            self.status = "stopping"
+            self._publish()
             self._finalize_charts()
             await self._safe_disconnect()
+            self.status = "stopped"
+            self._publish()
 
 
 async def main() -> None:
@@ -707,9 +887,15 @@ async def main() -> None:
         flush=True,
     )
     runner = HybridRunner(cfg)
-    await runner.run()
+    try:
+        await runner.run()
+    except KeyboardInterrupt:
+        runner.request_stop()
 
 
 if __name__ == "__main__":
     print("pocket_signal_bot: launch", flush=True)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\npocket_signal_bot: stopped", flush=True)

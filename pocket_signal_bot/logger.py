@@ -2,14 +2,31 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 
 class JsonEventLogger:
-    """Console-only event lines (no file logging)."""
+    """Console-only event lines (no file logging).
 
-    def __init__(self, *, console: bool = True) -> None:
+    ``on_event`` lets a UI subscribe to every event (used by the dashboard).
+    """
+
+    def __init__(
+        self,
+        *,
+        console: bool = True,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self.console = console
+        self.on_event = on_event
+
+    def _emit_sink(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(event_type, payload)
+        except Exception:
+            pass
 
     def _print_console(self, event_type: str, payload: dict[str, Any]) -> None:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -77,6 +94,7 @@ class JsonEventLogger:
             print(f"[{ts}] {event_type} {short}", flush=True)
 
     def log(self, event_type: str, **payload: Any) -> None:
+        self._emit_sink(event_type, dict(payload))
         if not self.console:
             return
         try:

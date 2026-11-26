@@ -108,6 +108,10 @@ class BotConfig:
     po_is_demo: bool = _env_bool("PO_IS_DEMO", True)
     po_region: str = os.getenv("PO_REGION", "DEMO")
 
+    # Paper mode (synthetic feed) — realistic random walk instead of a flat curve
+    paper_seed: int = _env_int("PO_PAPER_SEED", 0)
+    paper_volatility_pips: float = _env_float("PO_PAPER_VOLATILITY_PIPS", 1.3)
+
     # Browser (Playwright) options
     po_headless: bool = _env_bool("PO_HEADLESS", True)
     po_price_selectors: str = os.getenv("PO_PRICE_SELECTOR", "")

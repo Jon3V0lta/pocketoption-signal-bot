@@ -79,9 +79,19 @@ class EmaRsiStrategy:
     def generate(self, close_prices: List[float]) -> Signal:
         return self.generate_details(close_prices)["signal"]
 
+    @staticmethod
+    def _result(signal: Signal, reason: str, ema_diff: float, rsi_val: float, momentum: float) -> dict[str, Any]:
+        return {
+            "signal": signal,
+            "reason": reason,
+            "ema_diff": ema_diff,
+            "rsi": rsi_val,
+            "momentum": momentum,
+        }
+
     def generate_details(self, close_prices: List[float]) -> dict[str, Any]:
         if len(close_prices) < 3:
-            return {"signal": "NO_TRADE", "ema_diff": 0.0, "rsi": 50.0, "momentum": 0.0}
+            return self._result("NO_TRADE", "insufficient_data", 0.0, 50.0, 0.0)
 
         available = len(close_prices)
         ema_slow_period = min(self.cfg.ema_slow, max(2, available - 1))
@@ -93,7 +103,7 @@ class EmaRsiStrategy:
         r = rsi(close_prices, rsi_period)
 
         if f[-1] is None or s[-1] is None or r[-1] is None:
-            return {"signal": "NO_TRADE", "ema_diff": 0.0, "rsi": 50.0, "momentum": 0.0}
+            return self._result("NO_TRADE", "insufficient_data", 0.0, 50.0, 0.0)
 
         ema_diff = float(f[-1] - s[-1])
         rsi_val = float(r[-1])
@@ -108,7 +118,7 @@ class EmaRsiStrategy:
             base = abs(recent[-1]) if recent[-1] != 0 else 1.0
             range_pct = ((hi - lo) / base) * 100.0
             if range_pct < max(0.0, self.cfg.min_range_pct):
-                return {"signal": "NO_TRADE", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+                return self._result("NO_TRADE", "chop_filter", ema_diff, rsi_val, momentum)
 
         # Trend-streak filter: require stable EMA-diff sign across recent points.
         need = max(1, int(self.cfg.min_trend_streak))
@@ -116,31 +126,31 @@ class EmaRsiStrategy:
             diffs = [float(fi - si) for fi, si in zip(f, s) if fi is not None and si is not None]
             tail = diffs[-need:] if len(diffs) >= need else []
             if len(tail) < need:
-                return {"signal": "NO_TRADE", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+                return self._result("NO_TRADE", "trend_streak", ema_diff, rsi_val, momentum)
             if not (all(x > 0 for x in tail) or all(x < 0 for x in tail)):
-                return {"signal": "NO_TRADE", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+                return self._result("NO_TRADE", "trend_streak", ema_diff, rsi_val, momentum)
 
         # ── Primary strict triggers ──────────────────────────────────────────
         if ema_diff > self.cfg.min_ema_gap and rsi_val >= self.cfg.buy_rsi_min:
             if not self.cfg.require_momentum_confirm or momentum >= 0:
-                return {"signal": "CALL", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+                return self._result("CALL", "strict_trigger", ema_diff, rsi_val, momentum)
 
         if ema_diff < -self.cfg.min_ema_gap and rsi_val <= self.cfg.sell_rsi_max:
             if not self.cfg.require_momentum_confirm or momentum <= 0:
-                return {"signal": "PUT", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+                return self._result("PUT", "strict_trigger", ema_diff, rsi_val, momentum)
 
         # ── RSI neutral zone — stay flat in choppy / indecisive conditions ───
         neutral_band = max(0.0, self.cfg.rsi_neutral_band)
         if abs(rsi_val - 50.0) <= neutral_band:
-            return {"signal": "NO_TRADE", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+            return self._result("NO_TRADE", "rsi_neutral", ema_diff, rsi_val, momentum)
 
         # ── Trend-strength gate — block weak-trend fallback entries ──────────
         min_diff = max(0.0, self.cfg.min_abs_ema_diff)
         if min_diff > 0.0 and abs(ema_diff) < min_diff:
-            return {"signal": "NO_TRADE", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+            return self._result("NO_TRADE", "weak_trend", ema_diff, rsi_val, momentum)
 
         if not self.cfg.allow_fallback_vote:
-            return {"signal": "NO_TRADE", "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+            return self._result("NO_TRADE", "fallback_disabled", ema_diff, rsi_val, momentum)
 
         # ── Weighted vote fallback (only reached when trend IS present) ──────
         vote = 0
@@ -148,4 +158,4 @@ class EmaRsiStrategy:
         vote += 1 if rsi_val >= 50 else -1
         vote += 1 if momentum >= 0 else -1
         signal: Signal = "CALL" if vote >= 0 else "PUT"
-        return {"signal": signal, "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+        return self._result(signal, "vote_fallback", ema_diff, rsi_val, momentum)
