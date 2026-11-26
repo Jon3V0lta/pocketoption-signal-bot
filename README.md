@@ -31,7 +31,7 @@ python -m pocket_signal_bot.dashboard
 source .venv/bin/activate
 python -m pocket_signal_bot.dashboard      # web UI on :8000, autostarts paper mode
 python -m pocket_signal_bot.runner         # headless terminal mode
-python -m unittest discover -s tests -t .  # 40 unit tests
+python -m unittest discover -s tests -t .  # 49 unit tests
 ```
 
 Only `python-dotenv` + `matplotlib` are needed for paper mode and the dashboard; Playwright and the
@@ -53,7 +53,7 @@ things prevented it from actually running as a bot:
    (`strict_trigger`, `vote_fallback`, `chop_filter`, `rsi_neutral`, `trend_streak`,
    `fallback_disabled`, `insufficient_data`) so the UI can show *why* there is no trade.
 
-Also: dependency markers so `pip install -r requirements.txt` works on Linux/macOS, 40 unit tests,
+Also: dependency markers so `pip install -r requirements.txt` works on Linux/macOS, 49 unit tests,
 `setup.sh`, `.env.example` additions, and removed committed `__pycache__` artifacts.
 
 ## PocketOption bot architecture
